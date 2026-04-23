@@ -34,7 +34,16 @@ var notifyCmd = &cobra.Command{
 		"  notifypulse notify --destination ops-slack --title 'deploy complete'\n" +
 		"  echo 'long body' | notifypulse notify --to team --title 'weekly digest' --body-file -\n" +
 		"  notifypulse notify --to me --title 'build broken' --link https://ci.example/runs/42 \\\n" +
-		"     --dedup-key 'ci-build-42' --severity urgent",
+		"     --dedup-key 'ci-build-42' --severity urgent\n\n" +
+		"Exit codes:\n" +
+		"  0  every destination delivered\n" +
+		"  2  partial — at least one destination delivered, at least one failed\n" +
+		"  3  every destination failed\n" +
+		"  4  deduped — --dedup-key collided inside the 5-minute window; nothing was sent\n\n" +
+		"--dedup-key has a fixed 5-minute server-side window. Reusing a key inside\n" +
+		"that window silently swallows the second send. Pick stable, source-tied\n" +
+		"keys (e.g. 'build-482-failed', 'backup-2026-04-23'); for tests, omit the\n" +
+		"flag or use a unique value per call.",
 	RunE: runNotify,
 }
 
@@ -51,7 +60,7 @@ func init() {
 	f.StringVar(&notifySeverity, "severity", "", "urgent | normal | digest (default normal)")
 	f.StringVar(&notifyLink, "link", "", "URL to attach (shown as a button on Discord/Slack)")
 	f.StringVar(&notifyDedup, "dedup-key", "",
-		"Swallow duplicates with the same key within 5 minutes")
+		"Idempotency key. Repeats with the same key inside the fixed 5-minute server-side window are silently swallowed (exit 4). Use unique keys for tests; stable source-tied keys for production.")
 }
 
 func runNotify(cmd *cobra.Command, args []string) error {
@@ -95,6 +104,17 @@ func runNotify(cmd *cobra.Command, args []string) error {
 		if err := resolveDestinationIDs(ctx, c, notifyDests); err != nil {
 			return err
 		}
+	}
+
+	// Footgun warning: dedup-key inside the fixed 5-min server window will
+	// silently swallow the next send. Surface this once on stderr (in
+	// human-mode only — JSON consumers should already know via --help) so
+	// agents and scripters don't get bitten by reusing a test key.
+	if dedup := strings.TrimSpace(notifyDedup); dedup != "" && !jsonOutput {
+		fmt.Fprintln(os.Stderr, styles.Faint.Render(
+			"note: --dedup-key set; another notify with key="+dedup+
+				" inside the next 5 minutes will be swallowed (exit 4)",
+		))
 	}
 
 	resp, err := c.Notify(ctx, client.NotifyRequest{
