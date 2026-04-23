@@ -44,7 +44,7 @@ fs.mkdirSync(path.join(OUT_DIR, "bin"), { recursive: true });
 const pkgJson = {
   name: "@cloudboxsh/notifypulse",
   version: VERSION,
-  description: "Notifypulse CLI — one-API notification relay from the terminal.",
+  description: "Notifypulse CLI — one-API notification relay from the terminal (also an MCP server).",
   keywords: [
     "notifypulse",
     "cloudbox",
@@ -54,6 +54,7 @@ const pkgJson = {
     "slack",
     "webhook",
     "cli",
+    "mcp",
   ],
   homepage: "https://notifypulse.cloudbox.sh",
   bugs: "https://github.com/cloudbox-sh/notifypulse/issues",
