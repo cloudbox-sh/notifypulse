@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mdp/qrterminal/v3"
 	"github.com/spf13/cobra"
 
 	"github.com/cloudbox-sh/notifypulse/internal/client"
@@ -122,8 +125,7 @@ var (
 	destCreateConfig     string
 	destCreateURL        string
 	destCreateEmail      string
-	destCreateBotToken   string
-	destCreateChatID     string
+	destCreateBindingID  string
 	destCreateWebhookURL string
 )
 
@@ -134,8 +136,8 @@ func initDestinationsCreateFlags() {
 	f.StringVar(&destCreateConfig, "config", "", "Raw JSON config (escape hatch when shorthand flags don't cover it)")
 	f.StringVar(&destCreateURL, "url", "", "Webhook URL (shorthand for channel=webhook)")
 	f.StringVar(&destCreateEmail, "email", "", "Destination email (shorthand for channel=email)")
-	f.StringVar(&destCreateBotToken, "bot-token", "", "Telegram bot token (channel=telegram)")
-	f.StringVar(&destCreateChatID, "chat-id", "", "Telegram chat id (channel=telegram)")
+	f.StringVar(&destCreateBindingID, "binding-id", "",
+		"Telegram binding id (channel=telegram). Skip to run the interactive QR-deeplink connect flow.")
 	f.StringVar(&destCreateWebhookURL, "webhook-url", "",
 		"Discord or Slack incoming-webhook URL (channel=discord|slack)")
 }
@@ -147,10 +149,14 @@ var destinationsCreateCmd = &cobra.Command{
 		"Common shortcuts:\n" +
 		"  notifypulse destinations create --name ops --email ops@example.com\n" +
 		"  notifypulse destinations create --name ci-hook --url https://hooks.example.com/x\n" +
-		"  notifypulse destinations create --name personal --channel telegram \\\n" +
-		"     --bot-token 123:ABC --chat-id 12345\n" +
+		"  notifypulse destinations create --name personal --channel telegram\n" +
+		"      (interactive: prints a QR + deeplink, polls for the Start tap)\n" +
 		"  notifypulse destinations create --name dev --channel discord \\\n" +
 		"     --webhook-url https://discord.com/api/webhooks/…\n\n" +
+		"For Telegram, the CLI manages the connect flow with the Notifypulse-\n" +
+		"managed bot (@cloudbox_notifypulse_bot). Scan the QR with the Telegram\n" +
+		"app on your phone, or click the deeplink if Telegram Desktop is\n" +
+		"installed. Pass --binding-id directly to skip the connect flow.\n\n" +
 		"For anything unusual, pass raw JSON via --config and --channel.",
 	RunE: runDestinationsCreate,
 }
@@ -170,7 +176,7 @@ func runDestinationsCreate(cmd *cobra.Command, args []string) error {
 			channel = "email"
 		case destCreateURL != "":
 			channel = "webhook"
-		case destCreateBotToken != "" || destCreateChatID != "":
+		case destCreateBindingID != "":
 			channel = "telegram"
 		}
 	}
@@ -179,11 +185,11 @@ func runDestinationsCreate(cmd *cobra.Command, args []string) error {
 
 	// Have we got enough data to skip the form?
 	haveConfig := destCreateConfig != "" || destCreateEmail != "" || destCreateURL != "" ||
-		destCreateWebhookURL != "" || (destCreateBotToken != "" && destCreateChatID != "")
+		destCreateWebhookURL != "" || destCreateBindingID != ""
 	interactive := name == "" || channel == "" || !haveConfig
 
 	if interactive {
-		if err := requireFlagsForJSON("--name, --channel, and one of --email/--url/--webhook-url/--bot-token+--chat-id/--config"); err != nil {
+		if err := requireFlagsForJSON("--name, --channel, and one of --email/--url/--webhook-url/--binding-id/--config"); err != nil {
 			return err
 		}
 		if err := destinationCreateForm(&name, &channel); err != nil {
@@ -191,9 +197,20 @@ func runDestinationsCreate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Telegram requires a binding_id, which only exists once the user has
+	// tapped Start in a chat with the managed bot. If the caller didn't
+	// supply one, run the QR-deeplink connect flow now.
+	if channel == "telegram" && destCreateBindingID == "" && destCreateConfig == "" {
+		bindingID, err := connectTelegram(ctx, c)
+		if err != nil {
+			return err
+		}
+		destCreateBindingID = bindingID
+	}
+
 	config, err := buildDestinationConfig(channel,
 		destCreateEmail, destCreateURL, destCreateWebhookURL,
-		destCreateBotToken, destCreateChatID, destCreateConfig)
+		destCreateBindingID, destCreateConfig)
 	if err != nil {
 		return err
 	}
@@ -208,6 +225,74 @@ func runDestinationsCreate(cmd *cobra.Command, args []string) error {
 	}
 	return emitOK("destination", d.ID, d,
 		styles.Check()+" destination created "+styles.Faint.Render(d.ID))
+}
+
+// connectTelegram drives the QR-deeplink connect flow:
+//  1. POST /v1/telegram/connect to mint a single-use token
+//  2. render the deeplink URL as a terminal QR (scan with phone) + print the
+//     URL itself (click on desktop)
+//  3. poll every 2s until the binding lands or the token expires
+func connectTelegram(ctx context.Context, c *client.Client) (string, error) {
+	resp, err := c.IssueTelegramConnect(ctx)
+	if err != nil {
+		return "", handleAPIError(err, "telegram-connect", "")
+	}
+
+	// Friendly preamble — only when stdout is a terminal. JSON mode reaches
+	// here only via --binding-id (handled above), so a TTY is the safe
+	// assumption, but be defensive.
+	if !jsonOutput {
+		fmt.Println()
+		fmt.Println(styles.Accent.Render("Connect Telegram"))
+		fmt.Println(styles.Faint.Render("Scan with the Telegram app on your phone, or open the link below if Telegram Desktop is installed."))
+		fmt.Println()
+		qrterminal.GenerateWithConfig(resp.URL, qrterminal.Config{
+			Level:     qrterminal.M,
+			Writer:    os.Stdout,
+			BlackChar: qrterminal.BLACK,
+			WhiteChar: qrterminal.WHITE,
+			QuietZone: 1,
+		})
+		fmt.Println(styles.Faint.Render(resp.URL))
+		fmt.Println()
+		fmt.Println(styles.Faint.Render(
+			"Tap Start in the chat with @" + resp.BotUsername + ". For groups/channels, " +
+				"add the bot and post: /start@" + resp.BotUsername + " " + resp.Token[:8] + "…",
+		))
+		fmt.Println()
+		fmt.Println(styles.Faint.Render("Waiting…"))
+	}
+
+	// Poll every 2 seconds. Server enforces a 15-min token TTL but bound
+	// the wait here too so a backgrounded CLI doesn't hang forever.
+	deadline := time.Now().Add(15 * time.Minute)
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+
+	for {
+		status, err := c.PollTelegramConnect(ctx, resp.Token)
+		if err != nil {
+			return "", handleAPIError(err, "telegram-connect", "")
+		}
+		switch status.Status {
+		case "consumed":
+			if !jsonOutput {
+				fmt.Println(styles.Check() + " telegram chat bound " + styles.Faint.Render(status.BindingID))
+				fmt.Println()
+			}
+			return status.BindingID, nil
+		case "expired", "unknown":
+			return "", fmt.Errorf("connect link expired before it was used — try again")
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("timed out waiting for Telegram Start tap (15 min)")
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-tick.C:
+		}
+	}
 }
 
 // destinationCreateForm walks the user through a channel-aware TUI form.
@@ -247,16 +332,9 @@ func destinationCreateForm(name, channel *string) error {
 				Description("Notifypulse POSTs a JSON body with title/body/severity/link.").
 				Value(&destCreateURL).Validate(requireNonEmpty("url")),
 		).WithHideFunc(func() bool { return *channel != "webhook" }),
-		// Telegram -------------------------------------------------------
-		huh.NewGroup(
-			huh.NewInput().Title("Telegram bot token").
-				Description("Create a bot via @BotFather, paste the token here.").
-				EchoMode(huh.EchoModePassword).
-				Value(&destCreateBotToken).Validate(requireNonEmpty("bot token")),
-			huh.NewInput().Title("Telegram chat id").
-				Description("Numeric id of the user or group chat to deliver to.").
-				Value(&destCreateChatID).Validate(requireNonEmpty("chat id")),
-		).WithHideFunc(func() bool { return *channel != "telegram" }),
+		// Telegram has no form fields — the QR-deeplink connect flow runs
+		// after the form closes (runDestinationsCreate calls connectTelegram)
+		// and writes the binding id back into destCreateBindingID.
 		// Discord --------------------------------------------------------
 		huh.NewGroup(
 			huh.NewInput().Title("Discord webhook URL").
@@ -275,7 +353,7 @@ func destinationCreateForm(name, channel *string) error {
 
 // buildDestinationConfig assembles the channel-specific JSON config blob.
 // Raw --config wins over shorthand flags when both are supplied.
-func buildDestinationConfig(channel, email, webhookURL, incomingURL, botToken, chatID, raw string) (json.RawMessage, error) {
+func buildDestinationConfig(channel, email, webhookURL, incomingURL, bindingID, raw string) (json.RawMessage, error) {
 	if raw != "" {
 		if !json.Valid([]byte(raw)) {
 			return nil, fmt.Errorf("--config is not valid JSON")
@@ -294,10 +372,10 @@ func buildDestinationConfig(channel, email, webhookURL, incomingURL, botToken, c
 		}
 		return mustJSON(map[string]string{"url": webhookURL}), nil
 	case "telegram":
-		if botToken == "" || chatID == "" {
-			return nil, fmt.Errorf("telegram channel requires --bot-token and --chat-id")
+		if bindingID == "" {
+			return nil, fmt.Errorf("telegram channel requires --binding-id (or run without it for the interactive QR-deeplink connect flow)")
 		}
-		return mustJSON(map[string]string{"bot_token": botToken, "chat_id": chatID}), nil
+		return mustJSON(map[string]string{"binding_id": bindingID}), nil
 	case "discord", "slack":
 		if incomingURL == "" {
 			return nil, fmt.Errorf("%s channel requires --webhook-url", channel)

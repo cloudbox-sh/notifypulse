@@ -236,6 +236,50 @@ func (c *Client) Notify(ctx context.Context, req NotifyRequest) (*NotifyResponse
 	return &out, nil
 }
 
+// ── Telegram connect (/v1/telegram, API-key-authed) ─────────────────────
+//
+// The connect flow exists because Telegram refuses to let a bot DM a user
+// without explicit opt-in: the user has to tap Start in the chat with the
+// bot. We hand the user a single-use deeplink token; once they've tapped
+// Start, the binding is owned by their Notifypulse account and they get a
+// `binding_id` to feed into a telegram destination.
+
+// TelegramConnect is the response body of POST /v1/telegram/connect.
+type TelegramConnect struct {
+	Token       string `json:"token"`
+	URL         string `json:"url"`
+	BotUsername string `json:"bot_username"`
+	ExpiresAt   string `json:"expires_at"`
+}
+
+// TelegramConnectStatus is the response body of GET /v1/telegram/connect/{token}.
+type TelegramConnectStatus struct {
+	Status    string `json:"status"`     // pending | consumed | expired | unknown
+	BindingID string `json:"binding_id"` // populated when status=consumed
+	ExpiresAt string `json:"expires_at"`
+}
+
+// IssueTelegramConnect mints a fresh single-use deeplink token. The caller
+// shows resp.URL to the user (as a QR + clickable link) and then polls
+// TelegramConnectStatus until status=consumed.
+func (c *Client) IssueTelegramConnect(ctx context.Context) (*TelegramConnect, error) {
+	var out TelegramConnect
+	if err := c.do(ctx, "POST", "/v1/telegram/connect", map[string]any{}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// PollTelegramConnect returns the current status of an outstanding connect
+// token. Safe to call repeatedly until status != "pending".
+func (c *Client) PollTelegramConnect(ctx context.Context, token string) (*TelegramConnectStatus, error) {
+	var out TelegramConnectStatus
+	if err := c.do(ctx, "GET", "/v1/telegram/connect/"+url.PathEscape(token), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // ── Notifications (/v1/notifications, API-key-authed) ────────────────────
 
 type notificationsEnvelope struct {
